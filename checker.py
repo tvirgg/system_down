@@ -3,34 +3,60 @@ from bs4 import BeautifulSoup
 import time
 import logging
 import argparse
-from datetime import datetime
+from datetime import datetime, time as dt_time
 import os
-from dotenv import load_dotenv # <-- ДОБАВЛЕНО
+from dotenv import load_dotenv
 
 # --- ЗАГРУЗКА ПЕРЕМЕННЫХ ИЗ ФАЙЛА .env ---
-load_dotenv() # <-- ДОБАВЛЕНО
+load_dotenv()
 
-# --- НАСТРОЙКИ, ЧИТАЕМЫЕ ИЗ ФАЙЛА .env ---
+# --- 1. ГЛАВНЫЕ НАСТРОЙКИ (ЗДЕСЬ МОЖНО РЕДАКТИРОВАТЬ) ---
+
+# Ваши секретные данные, которые скрипт берет из файла .env
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_IDS_STR = os.getenv("TELEGRAM_CHAT_IDS", "")
-TELEGRAM_CHAT_IDS = TELEGRAM_CHAT_IDS_STR.split(',')
+TELEGRAM_CHAT_IDS = TELEGRAM_CHAT_IDS_STR.split(',') if TELEGRAM_CHAT_IDS_STR else []
 
-# --- ОБЩИЕ НАСТРОЙКИ ---
-CHECK_INTERVAL_SECONDS = 3600
+# Общие настройки работы
+CHECK_INTERVAL_SECONDS = 3600 # Интервал проверки (3600 = 1 час)
 REQUEST_TIMEOUT = 60
+DAILY_REPORT_HOUR = 11 # В 11 часов будет приходить ежедневный отчет
 
-# --- СИСТЕМНЫЕ КОНСТАНТЫ ---
-# ... (остальная часть кода остается абсолютно без изменений) ...
+# Список городов для мониторинга (можно добавлять новые)
+TARGET_CITIES = [
+    {
+        "name": "Астана",
+        "office": "ASTANA",
+        "calendar_id": "20213868"
+    },
+    {
+        "name": "Москва",
+        "office": "MOSKAU",
+        "calendar_id": "40044915"
+    }
+]
+
+# Список СРОЧНЫХ критериев (бот будет искать соответствие ЛЮБОМУ из них)
+URGENT_CRITERIA = [
+    {"type": "deadline", "value": datetime(2025, 9, 1), "message": "Найдена дата до 1 сентября"},
+    {"type": "deadline", "value": datetime(2025, 9, 20), "message": "Найдена дата до 20 сентября"},
+    # Можно добавить еще критерии, например, поиск конкретного месяца:
+    # {"type": "month", "value": ".08.", "message": "Найдена дата в августе"}
+]
+
+
+# --- 2. СИСТЕМНАЯ ЧАСТЬ (ЛУЧШЕ НЕ ТРОГАТЬ) ---
+
+# Системные константы
 APPOINTMENT_URL = 'https://appointment.bmeia.gv.at/HomeWeb/Scheduler'
-FORM_DATA = {'Language': 'ru', 'Office': 'ASTANA', 'CalendarId': '20213868', 'PersonCount': '1', 'Monday': '', 'Command': ''}
-TEST_AUGUST_FILE = "test_august.html"
-TEST_SEPTEMBER_FILE = "test_september.html"
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'ru-RU,ru;q=0.9', 'Origin': 'https://appointment.bmeia.gv.at', 'Referer': 'https://appointment.bmeia.gv.at/HomeWeb/Scheduler'}
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s', handlers=[logging.FileHandler("checker.log", encoding='utf-8'), logging.StreamHandler()])
 
+
 def send_telegram_notification(message):
+    """Отправляет сообщение через Telegram API каждому получателю из списка."""
     if not TELEGRAM_CHAT_IDS or not TELEGRAM_BOT_TOKEN:
-        logging.warning("Токен или Chat ID для Telegram не настроены. Уведомление не будет отправлено.")
+        logging.warning("Токен или Chat ID для Telegram не настроены.")
         return
     api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     for chat_id in TELEGRAM_CHAT_IDS:
@@ -38,81 +64,122 @@ def send_telegram_notification(message):
         payload = {'chat_id': chat_id.strip(), 'text': message, 'parse_mode': 'Markdown'}
         try:
             response = requests.post(api_url, json=payload, timeout=10)
-            if response.status_code == 200: logging.info(f"Уведомление в Telegram успешно отправлено на Chat ID: {chat_id}.")
-            else: logging.error(f"Не удалось отправить уведомление на Chat ID {chat_id}. Код ответа: {response.status_code}, Ответ: {response.text}")
+            if response.status_code == 200: logging.info(f"Уведомление отправлено на Chat ID: {chat_id}.")
+            else: logging.error(f"Ошибка отправки на Chat ID {chat_id}: {response.status_code}, {response.text}")
         except Exception as e:
-            logging.error(f"Ошибка при отправке уведомления на Chat ID {chat_id}: {e}")
+            logging.error(f"Ошибка соединения с Telegram API: {e}")
 
-def send_notification(message):
-    logging.critical("="*60); logging.critical("!!! ВНИМАНИЕ: НАЙДЕНА ПОДХОДЯЩАЯ ДАТА ЗАПИСИ !!!"); logging.critical(f"!!! {message} !!!"); logging.critical("="*60)
-    send_telegram_notification(f"🔥 *Найдена дата!* 🔥\n\nДетали: *{message}*")
 
-def check_for_appointments(session, search_mode, search_value, html_content=None):
+def send_urgent_alert(message, city_name, reason):
+    """Отправка срочного уведомления о найденной дате."""
+    full_message = f"🚨 *СРОЧНО: НАЙДЕНА ДАТА в г. {city_name.upper()}!* 🚨\n\n*Причина:* {reason}\n*Детали:* {message}"
+    logging.critical(full_message)
+    send_telegram_notification(full_message)
+
+
+def get_available_dates_for_target(session, target):
+    """Запрашивает и парсит все доступные даты для одного города."""
+    logging.info(f"Проверка города: {target['name']}...")
+    form_data = {'Language': 'ru', 'Office': target['office'], 'CalendarId': target['calendar_id'], 'PersonCount': '1', 'Monday': '', 'Command': ''}
+    dates = []
     try:
-        if html_content: html_to_parse = html_content
-        else:
-            response = session.post(APPOINTMENT_URL, data=FORM_DATA, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-            response.raise_for_status()
-            html_to_parse = response.text
-        soup = BeautifulSoup(html_to_parse, 'html.parser')
+        response = session.post(APPOINTMENT_URL, data=form_data, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
         date_headers = soup.find_all('th')
-        if not date_headers: return False
-        found_target_date = False
         for header in date_headers:
             date_text = header.get_text(strip=True)
-            if not date_text: continue
-            if search_mode == 'month':
-                if search_value in date_text:
-                    send_notification(f"ОБНАРУЖЕНА ДАТА В НУЖНОМ МЕСЯЦЕ: {date_text}"); found_target_date = True
-            elif search_mode == 'deadline':
+            if date_text:
                 try:
                     date_part = date_text.split(',')[-1].strip()
                     appointment_date = datetime.strptime(date_part, "%d.%m.%Y")
-                    if appointment_date < search_value:
-                        send_notification(f"ОБНАРУЖЕНА РАННЯЯ ДАТА: {date_text}"); found_target_date = True
-                except (ValueError, IndexError): logging.warning(f"Не удалось распознать дату в строке: '{date_text}'.")
-        if not found_target_date: logging.info("Подходящих дат на этой неделе не найдено.")
-        return found_target_date
+                    dates.append({"city": target['name'], "date_obj": appointment_date, "date_str": date_text})
+                except (ValueError, IndexError):
+                    continue
     except requests.exceptions.RequestException as e:
-        logging.error(f"Сетевая ошибка: {e}."); return False
-    except Exception as e:
-        logging.error(f"Непредвиденная ошибка в логике анализа: {e}"); return False
+        logging.error(f"Сетевая ошибка при проверке г. {target['name']}: {e}.")
+    return dates
 
-def run_test_mode(file_to_test, month_to_find_for_test, test_name):
-    logging.info(f"--- ЗАПУСК В РЕЖИМЕ ТЕСТИРОВАНИЯ: '{test_name}' ---")
-    try:
-        with open(file_to_test, 'r', encoding='utf-8') as f: test_html = f.read()
-        soup = BeautifulSoup(test_html, 'html.parser')
-        header = soup.find('th')
-        if header and month_to_find_for_test in header.get_text():
-            send_notification(f"ТЕСТОВАЯ ПРОВЕРКА: {header.get_text(strip=True)}"); logging.info(f"Тест '{test_name}' пройден.")
-        else: logging.warning(f"Тест '{test_name}' не пройден.")
-    except FileNotFoundError: logging.error(f"Ошибка теста: не найден файл '{file_to_test}'.")
 
-def run_production_mode(args):
-    if args.before_sept1: search_mode, search_value, log_message = 'deadline', datetime(2025, 9, 1), f"любая дата до 01.09.2025"
-    elif args.before_sept20: search_mode, search_value, log_message = 'deadline', datetime(2025, 9, 20), f"любая дата до 20.09.2025"
-    else: search_mode, search_value, log_message = 'month', ".08.", "любая дата в августе"
-    logging.info(f"--- ЗАПУСК В РАБОЧЕМ РЕЖИМЕ (Цель: {log_message}) ---")
+def run_urgent_check(session):
+    """Проверяет все города на соответствие любому из срочных критериев."""
+    logging.info("--- Запуск срочной проверки по всем критериям ---")
+    for city in TARGET_CITIES:
+        dates_found = get_available_dates_for_target(session, city)
+        for date_data in dates_found:
+            date_obj = date_data['date_obj']
+            date_str = date_data['date_str']
+            
+            # Проверяем на соответствие каждому срочному критерию
+            for criterion in URGENT_CRITERIA:
+                match = False
+                if criterion['type'] == 'deadline' and date_obj < criterion['value']:
+                    match = True
+                elif criterion['type'] == 'month' and criterion['value'] in date_str:
+                    match = True
+                
+                if match:
+                    send_urgent_alert(date_str, city['name'], criterion['message'])
+                    return True # Нашли, можно завершать работу всего скрипта
+    logging.info("Срочных дат по критериям не найдено.")
+    return False
+
+
+def run_daily_report(session):
+    """Собирает даты со всех городов и отправляет отчет о ближайшей."""
+    logging.info("--- ЗАПУСК ЕЖЕДНЕВНОГО ОТЧЕТА ---")
+    all_dates = []
+    for city in TARGET_CITIES:
+        all_dates.extend(get_available_dates_for_target(session, city))
+    
+    if not all_dates:
+        message = "📊 *Ежедневный отчет*\n\nНа данный момент свободных дат в Астане и Москве не найдено."
+        logging.info("Отчет: свободных дат нет.")
+    else:
+        closest_date_data = min(all_dates, key=lambda x: x['date_obj'])
+        city_name = closest_date_data['city']
+        date_str = closest_date_data['date_str']
+        message = f"📊 *Ежедневный отчет*\n\nБлижайшая доступная дата: *{date_str}* (г. {city_name})."
+        logging.info(f"Отчет: ближайшая дата {date_str} в г. {city_name}.")
+    
+    send_telegram_notification(message)
+
+
+def run_production_mode():
+    """Главный цикл работы бота."""
+    logging.info("--- ЗАПУСК БОТА В РАБОЧЕМ РЕЖИМЕ ---")
+    last_report_day = -1
     with requests.Session() as session:
         try:
             logging.info("Инициализация сессии..."); session.get(APPOINTMENT_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT); logging.info("Сессия успешно инициализирована.")
         except requests.exceptions.RequestException as e:
             logging.error(f"Не удалось инициализировать сессию: {e}."); return
+        
         while True:
-            if check_for_appointments(session, search_mode, search_value):
-                logging.info("Целевая дата найдена! Скрипт завершает работу."); break
+            now = datetime.now()
+            if now.hour == DAILY_REPORT_HOUR and now.day != last_report_day:
+                run_daily_report(session)
+                last_report_day = now.day
+
+            if run_urgent_check(session):
+                logging.info("Срочная дата найдена! Скрипт завершает работу."); break
+            
             logging.info(f"Следующая проверка через {CHECK_INTERVAL_SECONDS / 3600} час(а)."); time.sleep(CHECK_INTERVAL_SECONDS)
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Скрипт для мониторинга сайта записи на визу.", formatter_class=argparse.RawTextHelpFormatter)
-    mode_group = parser.add_mutually_exclusive_group()
-    mode_group.add_argument('--find-august', action='store_true', help='Искать любую дату в августе (режим по умолчанию).')
-    mode_group.add_argument('--before-sept1', action='store_true', help='Искать любую дату СТРОГО ДО 1 сентября 2025.')
-    mode_group.add_argument('--before-sept20', action='store_true', help='Искать любую дату СТРОГО ДО 20 сентября 2025.')
-    parser.add_argument('--test-august', action='store_true', help='ТЕСТ: проверить уведомление для августа.')
-    parser.add_argument('--test-september', action='store_true', help='ТЕСТ: проверить уведомление для сентября.')
+    parser = argparse.ArgumentParser(description="Скрипт мониторинга визовых дат.")
+    parser.add_argument('--force-report', action='store_true', help='ТЕСТ: принудительно запустить и отправить ежедневный отчет.')
+    parser.add_argument('--run', action='store_true', help='Запустить бота в рабочем режиме (режим по умолчанию).')
     args = parser.parse_args()
-    if args.test_august: run_test_mode(TEST_AUGUST_FILE, ".08.", "Проверка уведомлений для августа")
-    elif args.test_september: run_test_mode(TEST_SEPTEMBER_FILE, ".09.", "Проверка уведомлений для сентября")
-    else: run_production_mode(args)
+
+    if args.force_report:
+        with requests.Session() as s:
+            try:
+                s.get(APPOINTMENT_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+                run_daily_report(s)
+            except Exception as e:
+                logging.error(f"Не удалось запустить тестовый отчет: {e}")
+    else:
+        # Любой запуск без флага --force-report будет рабочим
+        run_production_mode()
